@@ -214,8 +214,13 @@ def _to_number(v):
 
 def parse_tender_excel(file_like, sheet=0):
     """
-    Разбирает "Сводную оценочную таблицу".
-    Возвращает dict:
+    Универсальный разбор 'Сводной таблицы предложений' / 'Конкурентного листа'.
+
+    Поддерживает два формата:
+      A) Отдельная строка "ИНН" (файл 19377-ТУ).
+      B) ИНН прямо в названии фирмы: ООО "..." (ИНН 1234567890) (файл 20893-ТТ).
+
+    Возвращает:
       {
         'participants': [{'inn':..., 'name':..., 'prices': {lot_title: sum}}],
         'lots': [lot_title, ...],
@@ -224,29 +229,106 @@ def parse_tender_excel(file_like, sheet=0):
     df = pd.read_excel(file_like, sheet_name=sheet, header=None, dtype=object)
     n_rows, n_cols = df.shape
 
-    # --- 1. Строка с ИНН ---
+    # ------------------------------------------------------------------
+    # 1. Определяем формат и находим строку-шапку с участниками
+    # ------------------------------------------------------------------
+    # Формат B: строка, где в ячейках есть "ООО"/"ИП" и "(ИНН ...)"
+    participant_header_row = None
+    header_participants = []  # [(col, inn, name)]
+
+    for r in range(min(n_rows, 40)):  # шапка обычно сверху
+        found = []
+        for c in range(n_cols):
+            v = _norm(df.iat[r, c])
+            if not v:
+                continue
+            m = re.search(r"\(?\s*ИНН\s*[:№]?\s*(\d{10}|\d{12})\s*\)?", v, flags=re.IGNORECASE)
+            if m:
+                inn = m.group(1)
+                # имя = текст до "(ИНН"
+                name_part = re.split(r"\(?\s*ИНН", v, flags=re.IGNORECASE)[0]
+                name_part = name_part.strip(" \t\"'«»")
+                found.append((c, inn, name_part or v))
+        if len(found) >= 2:  # минимум 2 участника — уже похоже на шапку
+            participant_header_row = r
+            header_participants = found
+            break
+
+    # Формат A: отдельная строка "ИНН"
     inn_row = None
-    for r in range(n_rows):
-        for c in range(n_cols):
-            if _norm(df.iat[r, c]).upper().startswith("ИНН"):
-                inn_row = r
+    if participant_header_row is None:
+        for r in range(n_rows):
+            for c in range(n_cols):
+                if _norm(df.iat[r, c]).upper().startswith("ИНН"):
+                    inn_row = r
+                    break
+            if inn_row is not None:
                 break
-        if inn_row is not None:
-            break
-    if inn_row is None:
-        raise RuntimeError("Не найдена строка с 'ИНН'")
 
-    # --- 2. Названия фирм (строка "Наименование контрагента") ---
-    name_row = None
-    for r in range(n_rows):
-        for c in range(n_cols):
-            if "наименование контрагента" in _norm(df.iat[r, c]).lower():
-                name_row = r
+    # ------------------------------------------------------------------
+    # 2. Собираем участников
+    # ------------------------------------------------------------------
+    participants = []  # [{'inn':..., 'name':..., 'inn_col':..., 'sum_col':...}]
+
+    if participant_header_row is not None:
+        # --- Формат B ---
+        for col, inn, name in header_participants:
+            participants.append({"inn": inn, "name": name, "inn_col": col, "sum_col": None})
+    else:
+        # --- Формат A ---
+        if inn_row is None:
+            raise RuntimeError(
+                "Не найдена ни строка 'ИНН', ни шапка с '(ИНН ...)'. "
+                "Проверьте, что это таблица предложений."
+            )
+        # Имена фирм — строкой выше
+        name_row = None
+        for r in range(n_rows):
+            for c in range(n_cols):
+                if "наименование контрагента" in _norm(df.iat[r, c]).lower():
+                    name_row = r
+                    break
+            if name_row is not None:
                 break
-        if name_row is not None:
+
+        inn_cells = []
+        for c in range(n_cols):
+            v = _norm(df.iat[inn_row, c]).replace(" ", "")
+            if re.fullmatch(r"\d{10}(\d{2})?", v):
+                inn_cells.append((c, v))
+
+        if not inn_cells:
+            raise RuntimeError("В строке 'ИНН' не найдено ни одного корректного ИНН")
+
+        for inn_col, inn in inn_cells:
+            firm = ""
+            if name_row is not None:
+                for dc in (0, -1, 1, 2, -2):
+                    cc = inn_col + dc
+                    if 0 <= cc < n_cols:
+                        v = _norm(df.iat[name_row, cc])
+                        if v and not v.isdigit() and len(v) > 3:
+                            firm = v
+                            break
+            participants.append({"inn": inn, "name": firm, "inn_col": inn_col, "sum_col": None})
+
+    # ------------------------------------------------------------------
+    # 3. Находим строку-шапку колонок "Цена за ед." / "Сумма"
+    #    чтобы понять, где именно лежат суммы по участникам
+    # ------------------------------------------------------------------
+    # Ищем строку, где есть "Цена за ед" и "Сумма"
+    header_row = None
+    for r in range(n_rows):
+        txt = " ".join(_norm(df.iat[r, c]).lower() for c in range(n_cols))
+        if "цена за ед" in txt and ("сумма" in txt or "стоимость" in txt):
+            header_row = r
             break
 
-    # --- 3. Строка "Система налогообложения" — по ней находим колонки сумм ---
+    # Для каждого участника находим колонку суммы:
+    # — берём колонку участника (inn_col) и идём вправо до первой колонки,
+    #   где в header_row есть "сумма"/"стоимость всего".
+    # Если header_row не найден — эвристика: сумма = ближайшая правая колонка
+    #   среди всех колонок, где в строке "Система налогообложения" есть "НДС"/"УСН".
     tax_row = None
     for r in range(n_rows):
         for c in range(n_cols):
@@ -256,64 +338,79 @@ def parse_tender_excel(file_like, sheet=0):
         if tax_row is not None:
             break
 
-    participant_cols = []
+    # Колонки, где в tax_row есть "НДС"/"УСН" — кандидаты на "колонку участника"
+    tax_cols = []
     if tax_row is not None:
         for c in range(n_cols):
-            v = _norm(df.iat[tax_row, c])
-            if "ндс" in v.lower() or "усн" in v.lower():
-                participant_cols.append(c)
+            v = _norm(df.iat[tax_row, c]).lower()
+            if "ндс" in v or "усн" in v:
+                tax_cols.append(c)
 
-    # --- 4. ИНН и имена ---
-    inn_cells = []
-    for c in range(n_cols):
-        v = _norm(df.iat[inn_row, c]).replace(" ", "")
-        if re.fullmatch(r"\d{10}(\d{2})?", v):
-            inn_cells.append((c, v))
-
-    if not inn_cells:
-        raise RuntimeError("Не найдены ИНН участников")
-
-    participants = []
-    for inn_col, inn in inn_cells:
-        firm = ""
-        if name_row is not None:
-            for dc in (0, -1, 1, 2, -2):
-                cc = inn_col + dc
-                if 0 <= cc < n_cols:
-                    v = _norm(df.iat[name_row, cc])
-                    if v and not v.isdigit() and len(v) > 3:
-                        firm = v
-                        break
-        # колонка суммы — ближайшая правая из participant_cols
+    for p in participants:
+        inn_col = p["inn_col"]
         sum_col = None
-        for c in participant_cols:
-            if c >= inn_col:
-                sum_col = c
-                break
+
+        if header_row is not None:
+            # Ищем ближайшую правую колонку с "сумма" в шапке
+            for c in range(inn_col, n_cols):
+                hv = _norm(df.iat[header_row, c]).lower()
+                if "сумма" in hv or "стоимость всего" in hv:
+                    sum_col = c
+                    break
+            # Если не нашли справа — попробуем в самой колонке inn_col
+            if sum_col is None:
+                hv = _norm(df.iat[header_row, inn_col]).lower()
+                if "сумма" in hv or "стоимость всего" in hv:
+                    sum_col = inn_col
+
+        # Fallback: берём ближайшую правую колонку из tax_cols
+        if sum_col is None:
+            for c in tax_cols:
+                if c >= inn_col:
+                    sum_col = c
+                    break
+
+        # Последний fallback: сама колонка участника
         if sum_col is None:
             sum_col = inn_col
-        participants.append({"inn": inn, "name": firm, "sum_col": sum_col})
 
-    # --- 5. Строки-шапки лотов ---
-    lot_rows = []  # (row_idx, lot_title)
+        p["sum_col"] = sum_col
+
+    # ------------------------------------------------------------------
+    # 4. Находим строки-шапки лотов
+    # ------------------------------------------------------------------
+    lot_rows = []  # [(row_idx, lot_title)]
     for r in range(n_rows):
         name_v = _norm(df.iat[r, 2])  # колонка C
+        # В файле 20893-ТТ: "Лот №1 - Арматура"
+        # В файле 19377-ТУ: "Лот №1 - 1. Навесной фасад ..."
         if name_v.lower().startswith("лот №"):
             lot_rows.append((r, name_v))
 
     if not lot_rows:
         raise RuntimeError("Не найдены строки лотов ('Лот №...')")
 
-    # --- 6. Собираем суммы ---
+    # ------------------------------------------------------------------
+    # 5. Собираем суммы: для каждого лота и участника
+    # ------------------------------------------------------------------
     lots = [t for _, t in lot_rows]
     for p in participants:
         p["prices"] = {}
         for r, lot_title in lot_rows:
             raw = df.iat[r, p["sum_col"]]
             num = _to_number(raw)
-            p["prices"][lot_title] = num if num is not None else 0.0
+            p["prices"][lot_title] = float(num) if num is not None else 0.0
 
-    return {"participants": participants, "lots": lots}
+    # Убираем дубли ИНН (иногда попадаются)
+    seen = set()
+    uniq = []
+    for p in participants:
+        if p["inn"] in seen:
+            continue
+        seen.add(p["inn"])
+        uniq.append(p)
+
+    return {"participants": uniq, "lots": lots}
 
 
 # ============================================================================
